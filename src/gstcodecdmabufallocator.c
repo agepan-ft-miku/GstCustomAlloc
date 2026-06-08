@@ -13,10 +13,12 @@
 struct _GstCodecDmabufAllocator {
   GstAllocator parent_instance;
 
+  /* device_fd と driver ops は allocator が所有し、element からは触らせない。 */
   gchar *device_path;
   int device_fd;
   CodecDmabufDriverOps ops;
 
+  /* 実際の GstMemory は公式 GstDmaBufAllocator で作る。 */
   GstAllocator *dmabuf_allocator;
   guint64 allocator_id;
 
@@ -61,6 +63,7 @@ codec_dmabuf_allocator_ensure_open (GstCodecDmabufAllocator *self)
   return opened;
 }
 
+/* allocation 途中で失敗した場合は、作成済み driver resource だけを逆順に戻す。 */
 static void
 codec_dmabuf_allocator_rollback (GstCodecDmabufAllocator *self,
     gpointer addr, int exported_fd, gboolean export_active)
@@ -90,6 +93,7 @@ codec_dmabuf_allocator_alloc (GstAllocator *allocator, gsize size,
   if (!codec_dmabuf_allocator_ensure_open (self))
     return NULL;
 
+  /* driver allocation は常に固定最大サイズで行う。 */
   memset (&alloc_arg, 0, sizeof (alloc_arg));
   alloc_arg.size = CODEC_DMABUF_ALLOCATION_SIZE;
   alloc_arg.flag = CODEC_DMABUF_DRIVER_ALLOC_FLAG;
@@ -120,6 +124,7 @@ codec_dmabuf_allocator_alloc (GstAllocator *allocator, gsize size,
     return NULL;
   }
 
+  /* GstDmaBufMemory に渡した duplicated fd は GstDmaBufMemory 側の所有になる。 */
   memory = gst_dmabuf_allocator_alloc (self->dmabuf_allocator, duplicated_fd,
       CODEC_DMABUF_ALLOCATION_SIZE);
   if (memory == NULL) {
@@ -131,6 +136,7 @@ codec_dmabuf_allocator_alloc (GstAllocator *allocator, gsize size,
 
   dmabuf_memory = gst_codec_dmabuf_memory_new (self, self->device_fd,
       export_arg.buf, alloc_arg.addr, CODEC_DMABUF_ALLOCATION_SIZE);
+  /* driver の元 fd/addr は memory qdata に紐づけて、memory finalize 時に解放する。 */
   if (dmabuf_memory == NULL ||
       !gst_codec_dmabuf_memory_attach (memory, dmabuf_memory)) {
     if (dmabuf_memory != NULL)
@@ -145,6 +151,7 @@ codec_dmabuf_allocator_alloc (GstAllocator *allocator, gsize size,
 static void
 codec_dmabuf_allocator_free (GstAllocator *allocator, GstMemory *memory)
 {
+  /* alloc() は公式 GstDmaBufMemory を返すため、driver cleanup は qdata 側で行う。 */
   (void) allocator;
   (void) memory;
 }
@@ -239,6 +246,7 @@ gst_codec_dmabuf_standard_pool_new (GstCodecDmabufAllocator *allocator,
   g_return_val_if_fail (GST_IS_CODEC_DMABUF_ALLOCATOR (allocator), NULL);
   g_return_val_if_fail (caps != NULL, NULL);
 
+  /* 再利用と min/max 管理は標準 GstBufferPool に任せる。 */
   pool = gst_buffer_pool_new ();
   config = gst_buffer_pool_get_config (pool);
   gst_buffer_pool_config_set_params (config, caps,
@@ -275,6 +283,7 @@ gst_codec_dmabuf_allocator_release_driver_memory (
   export_arg.addr = addr;
   export_arg.buf = exported_fd;
 
+  /* qdata destroy から呼ばれるため、driver ops 呼び出しも allocator lock で守る。 */
   g_mutex_lock (&allocator->lock);
   if (export_active && exported_fd >= 0 && allocator->ops.export_end != NULL)
     allocator->ops.export_end (device_fd, &export_arg);

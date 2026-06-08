@@ -23,6 +23,7 @@ codec_dmabuf_driver_allocate (int device_fd, MmAllocIoctl *arg)
 #ifdef MM_IOC_ALLOC_CO
   return ioctl (device_fd, MM_IOC_ALLOC_CO, arg);
 #else
+  /* driver ioctl 定義が無い build では、実機 allocation は未対応にする。 */
   (void) device_fd;
   (void) arg;
   errno = ENOTSUP;
@@ -49,6 +50,7 @@ codec_dmabuf_driver_export_start (int device_fd, MmExportIoctl *arg)
 #ifdef MM_IOC_EXPORT_START
   return ioctl (device_fd, MM_IOC_EXPORT_START, arg);
 #else
+  /* export_start が無い環境では外部 DMABUF fd を生成できない。 */
   (void) device_fd;
   (void) arg;
   errno = ENOTSUP;

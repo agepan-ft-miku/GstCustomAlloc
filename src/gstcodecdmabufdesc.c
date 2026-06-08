@@ -34,6 +34,7 @@ gst_codec_dmabuf_buffer_to_nv12_desc (GstBuffer *buffer, guint width,
   if (borrowed_fd < 0)
     return FALSE;
 
+  /* codec が非同期に fd を保持してもよいよう、borrowed fd は必ず dup する。 */
   duplicated_fd = dup (borrowed_fd);
   if (duplicated_fd < 0)
     return FALSE;
@@ -46,6 +47,7 @@ gst_codec_dmabuf_buffer_to_nv12_desc (GstBuffer *buffer, guint width,
   out_desc->uv_offset = dmabuf_memory->offsets[CODEC_DMABUF_UV_PLANE];
   out_desc->uv_stride = dmabuf_memory->strides[CODEC_DMABUF_UV_PLANE];
   out_desc->size = dmabuf_memory->size;
+  /* duplicated fd の利用中は対応する buffer も保持する。 */
   out_desc->buffer_ref = gst_buffer_ref (buffer);
 
   return TRUE;

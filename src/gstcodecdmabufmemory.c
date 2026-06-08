@@ -3,6 +3,7 @@
 static GQuark
 codec_dmabuf_memory_quark (void)
 {
+  /* この qdata key で「本 module 由来の DMABUF」を識別する。 */
   return g_quark_from_static_string ("gst-codec-dmabuf-memory");
 }
 
@@ -41,6 +42,7 @@ gst_codec_dmabuf_memory_free (CodecDmabufMemory *memory)
     return;
 
   if (memory->allocator != NULL) {
+    /* 最後の memory ref が落ちたタイミングで export_end/free を実行する。 */
     gst_codec_dmabuf_allocator_release_driver_memory (memory->allocator,
         memory->device_fd, memory->addr, memory->size, memory->exported_fd,
         memory->export_active);
@@ -101,6 +103,7 @@ gst_codec_dmabuf_buffer_get_memory_kind (GstBuffer *buffer)
   if (!gst_is_dmabuf_memory (memory))
     return GST_CODEC_DMABUF_MEMORY_KIND_SYSTEM;
 
+  /* DMABUF でも qdata が無ければ、この codec allocator 由来ではない。 */
   if (gst_codec_dmabuf_memory_get (memory) == NULL)
     return GST_CODEC_DMABUF_MEMORY_KIND_OTHER_DMABUF;
 
@@ -145,6 +148,7 @@ gst_codec_dmabuf_buffer_is_supported_input (GstBuffer *buffer,
       gst_codec_dmabuf_allocator_get_id (allocator))
     return FALSE;
 
+  /* 初期実装では 1 fd / fixed NV12 layout のみを codec 入力として認める。 */
   return dmabuf_memory->format == CODEC_DMABUF_FORMAT &&
       dmabuf_memory->n_planes == CODEC_DMABUF_N_PLANES &&
       dmabuf_memory->offsets[CODEC_DMABUF_Y_PLANE] == CODEC_DMABUF_Y_OFFSET &&
