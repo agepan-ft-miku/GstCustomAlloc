@@ -51,6 +51,10 @@ DMA-BUF support:
 | `src/gstcodeccaps.h` | Supported caps constants and fixed format limits. |
 | `src/gstcodeccaps.c` | Caps validation helpers. |
 | `src/gstdmabufutils.c` | DMA-BUF allocation and peer caps query helpers. |
+| `src/gstcodecdmabufallocator.c` | Driver-backed custom `GstAllocator` for the hardware-codec DMABUF path. |
+| `src/gstcodecdmabufdriver.c` | Codec memory driver ops wrapper and fake-test boundary. |
+| `src/gstcodecdmabufmemory.c` | `GstDmaBufMemory` qdata, origin checks, and memory-kind helpers. |
+| `src/gstcodecdmabufdesc.c` | NV12 descriptor creation from codec-owned DMABUF memory. |
 | `tests/test_codec_caps.c` | Unit tests for supported caps checks. |
 | `docs/h264_sample_notes.md` | Educational notes about raw image and H.264 access unit handling. |
 | `docs/gstreamer_push_pull_considerations.md` | Push/pull scheduling considerations for codec plugin design. |
@@ -146,7 +150,7 @@ Responsibilities:
 
 DMA-BUF is used as a buffer transport mechanism. The current codec path still maps data for CPU processing.
 
-The planned hardware-codec path uses a stricter allocator design described in
+The hardware-codec path uses a stricter allocator design described in
 `docs/dmabuf_allocator_design.md`. In that design, a custom `GstAllocator` owns
 driver allocation, `export_start`, `export_end`, and driver free. It returns
 official `GstDmaBufMemory` with qdata that carries the driver resource lifetime.
