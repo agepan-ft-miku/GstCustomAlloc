@@ -78,6 +78,44 @@ src/
 
 element は driver ioctl を直接呼ばない。driver resource の寿命は allocator と memory qdata に閉じる。
 
+構造図:
+
+```mermaid
+flowchart TB
+  Elem["Codec Element"]
+  Pool["standard GstBufferPool"]
+  Alloc["GstCodecDmabufAllocator\ncustom GstAllocator"]
+  DmaAlloc["GstDmaBufAllocator\nofficial allocator"]
+  Mem["GstDmaBufMemory\n+ CodecDmabufMemory qdata"]
+  Desc["CodecNv12BufferDesc"]
+  Ops["CodecDmabufDriverOps"]
+  Driver["Codec Memory Driver"]
+
+  Elem -->|"configure / acquire"| Pool
+  Pool -->|"gst_allocator_alloc()"| Alloc
+  Alloc -->|"allocate / export_start / export_end / free"| Ops
+  Ops -->|"open / ioctl / close"| Driver
+  Alloc -->|"wrap duplicated fd"| DmaAlloc
+  DmaAlloc --> Mem
+  Alloc -->|"attach qdata"| Mem
+  Elem -->|"validate / fd dup"| Desc
+  Mem --> Desc
+```
+
+ownership 境界:
+
+```mermaid
+flowchart LR
+  DriverFd["device fd\nallocator owns"]
+  ExportedFd["exported fd\nqdata owns"]
+  DuplicatedFd["duplicated fd\nGstDmaBufMemory owns"]
+  DescriptorFd["descriptor fd\nCodecNv12BufferDesc owns"]
+
+  DriverFd --> ExportedFd
+  ExportedFd -->|"dup for GstMemory"| DuplicatedFd
+  DuplicatedFd -->|"borrow + dup"| DescriptorFd
+```
+
 ## 5. 固定仕様
 
 初期実装では format と最大サイズを固定する。
@@ -212,6 +250,34 @@ export_end
 free
 ```
 
+allocation sequence:
+
+```mermaid
+sequenceDiagram
+  participant Pool as standard GstBufferPool
+  participant Alloc as GstCodecDmabufAllocator
+  participant Ops as CodecDmabufDriverOps
+  participant Driver as Codec Memory Driver
+  participant Dma as GstDmaBufAllocator
+  participant Mem as GstDmaBufMemory
+
+  Pool->>Alloc: gst_allocator_alloc(size)
+  Alloc->>Alloc: ensure driver open
+  Alloc->>Ops: allocate(size, flag)
+  Ops->>Driver: ioctl(MM_IOC_ALLOC_CO)
+  Driver-->>Ops: addr
+  Ops-->>Alloc: addr
+  Alloc->>Ops: export_start(size, addr)
+  Ops->>Driver: ioctl(MM_IOC_EXPORT_START)
+  Driver-->>Ops: exported_fd
+  Ops-->>Alloc: exported_fd
+  Alloc->>Alloc: dup(exported_fd)
+  Alloc->>Dma: gst_dmabuf_allocator_alloc(dup_fd, size)
+  Dma-->>Alloc: GstDmaBufMemory
+  Alloc->>Mem: attach CodecDmabufMemory qdata
+  Alloc-->>Pool: GstMemory
+```
+
 ## 9. Free Flow
 
 公式 `GstDmaBufMemory` は、`gst_dmabuf_allocator_alloc()` に渡された duplicated fd を所有する。
@@ -228,6 +294,27 @@ GstDmaBufMemory finalize:
 
 重要な点は、custom allocator の `free` vfunc に driver cleanup を依存させないことである。返す memory は公式 `GstDmaBufMemory` なので、driver cleanup は memory qdata destroy path から必ず到達できる必要がある。
 
+free sequence:
+
+```mermaid
+sequenceDiagram
+  participant Mem as GstDmaBufMemory
+  participant Qdata as CodecDmabufMemory qdata
+  participant Alloc as GstCodecDmabufAllocator
+  participant Ops as CodecDmabufDriverOps
+  participant Driver as Codec Memory Driver
+
+  Mem->>Mem: finalize duplicated fd
+  Mem->>Qdata: destroy notify
+  Qdata->>Alloc: release_driver_memory()
+  Alloc->>Ops: export_end(size, addr, exported_fd)
+  Ops->>Driver: ioctl(MM_IOC_EXPORT_END)
+  Alloc->>Ops: free(size, flag, addr)
+  Ops->>Driver: ioctl(MM_IOC_FREE_CO)
+  Alloc->>Alloc: close(exported_fd)
+  Qdata->>Qdata: unref allocator
+```
+
 ## 10. 標準 GstBufferPool の使用
 
 element は標準 `GstBufferPool` を作成し、custom allocator を設定する。
@@ -243,6 +330,29 @@ gst_buffer_pool_set_active(pool, TRUE)
 ```
 
 標準 pool は、設定された `GstCodecDmabufAllocator` に memory allocation を依頼するだけでよい。pool は driver の `export_start`、`export_end`、`free` を知らない。
+
+標準 pool 経由の処理境界:
+
+```mermaid
+flowchart TD
+  Configure["element configures standard GstBufferPool"]
+  Acquire["gst_buffer_pool_acquire_buffer()"]
+  AllocCall["pool calls GstCodecDmabufAllocator::alloc()"]
+  Buffer["GstBuffer\n1 GstDmaBufMemory"]
+  Meta["ensure GstVideoMeta\nfixed NV12 offset/stride"]
+  Submit["create descriptor\nsubmit to codec"]
+  Release["buffer ref drops\npool may reuse"]
+  Finalize["memory finalizes\nqdata releases driver resource"]
+
+  Configure --> Acquire
+  Acquire --> AllocCall
+  AllocCall --> Buffer
+  Buffer --> Meta
+  Meta --> Submit
+  Submit --> Release
+  Release -->|"reuse while pool keeps refs"| Acquire
+  Release -->|"last memory ref"| Finalize
+```
 
 ## 11. Buffer Metadata
 
