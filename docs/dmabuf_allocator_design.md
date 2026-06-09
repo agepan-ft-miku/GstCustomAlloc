@@ -175,6 +175,86 @@ typedef struct _GstCodecDmabufAllocator {
 
 `alloc` vfunc は driver で memory を確保し、公式 `GstDmaBufMemory` を返す。
 
+### 6.1 class_init / init / finalize Flow
+
+`GstCodecDmabufAllocator` は `G_DEFINE_TYPE()` で定義する GObject 型であり、class 初期化、instance 初期化、破棄処理の責務を分ける。
+
+`class_init` では型全体の vfunc を登録する。ここでは instance 固有の fd や driver 状態は触らない。
+
+```text
+gst_codec_dmabuf_allocator_class_init:
+  object_class = G_OBJECT_CLASS(klass)
+  allocator_class = GST_ALLOCATOR_CLASS(klass)
+
+  object_class->finalize = gst_codec_dmabuf_allocator_finalize
+  allocator_class->alloc = codec_dmabuf_allocator_alloc
+  allocator_class->free = codec_dmabuf_allocator_free
+```
+
+`init` では allocator instance ごとの初期状態を作る。driver device はここでは open しない。実際の open は最初の allocation 時に遅延実行する。
+
+```text
+gst_codec_dmabuf_allocator_init:
+  allocator->mem_type = "CodecDmabuf"
+  set GST_ALLOCATOR_FLAG_CUSTOM_ALLOC
+
+  device_fd = -1
+  ops = default driver ops
+  dmabuf_allocator = gst_dmabuf_allocator_new()
+  allocator_id = next unique id
+  init lock
+```
+
+`finalize` では allocator instance が所有する resource だけを解放する。各 memory の driver allocation は `GstDmaBufMemory` qdata destroy path が解放するため、`finalize` では個別 buffer の `export_end/free` は行わない。
+
+```text
+gst_codec_dmabuf_allocator_finalize:
+  lock
+  if opened:
+    close(device_fd)
+  opened = FALSE
+  device_fd = -1
+  unlock
+
+  unref internal GstDmaBufAllocator
+  free device_path
+  clear lock
+  chain up to parent finalize
+```
+
+lifecycle sequence:
+
+```mermaid
+sequenceDiagram
+  participant Type as GType system
+  participant Class as GstCodecDmabufAllocatorClass
+  participant Inst as GstCodecDmabufAllocator
+  participant Dma as GstDmaBufAllocator
+  participant Driver as CodecDmabufDriverOps
+
+  Type->>Class: class_init()
+  Class->>Class: install finalize vfunc
+  Class->>Class: install allocator alloc/free vfuncs
+
+  Type->>Inst: instance init()
+  Inst->>Inst: set mem_type and custom alloc flag
+  Inst->>Inst: device_fd = -1, opened = FALSE
+  Inst->>Inst: copy default driver ops
+  Inst->>Dma: gst_dmabuf_allocator_new()
+  Inst->>Inst: assign allocator_id and init lock
+
+  Note over Inst,Driver: driver open is deferred until alloc()
+
+  Type->>Inst: finalize()
+  Inst->>Inst: lock
+  alt driver opened
+    Inst->>Driver: close(device_fd)
+  end
+  Inst->>Inst: reset opened/device_fd and unlock
+  Inst->>Dma: unref
+  Inst->>Inst: free device_path and clear lock
+```
+
 ## 7. CodecDmabufMemory
 
 driver resource の寿命情報は `GstDmaBufMemory` の `GstMiniObject` qdata に付与する。
