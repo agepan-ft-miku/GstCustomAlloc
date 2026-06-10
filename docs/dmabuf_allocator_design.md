@@ -179,6 +179,30 @@ typedef struct _GstCodecDmabufAllocator {
 
 `GstCodecDmabufAllocator` は `G_DEFINE_TYPE()` で定義する GObject 型であり、class 初期化、instance 初期化、破棄処理の責務を分ける。
 
+`gst_codec_dmabuf_allocator_new()` は `class_init` や `init` を直接呼ばない。`g_object_new()` を呼び、GObject type system が必要に応じて `class_init` を 1 回だけ実行し、その後 instance ごとに `init` を実行する。
+
+```mermaid
+flowchart TD
+  New["gst_codec_dmabuf_allocator_new(device_path)"]
+  GObjectNew["g_object_new(GST_TYPE_CODEC_DMABUF_ALLOCATOR)"]
+  ClassReady{"class initialized?"}
+  ClassInit["gst_codec_dmabuf_allocator_class_init()\n型共通 vfunc を登録"]
+  Init["gst_codec_dmabuf_allocator_init()\ninstance 初期状態を作成"]
+  SetPath["new() body\ndevice_path を設定"]
+  Return["return GstAllocator*"]
+
+  New --> GObjectNew
+  GObjectNew --> ClassReady
+  ClassReady -->|"no: 初回だけ"| ClassInit
+  ClassInit --> Init
+  ClassReady -->|"yes: 2回目以降"| Init
+  Init --> GObjectNew
+  GObjectNew --> SetPath
+  SetPath --> Return
+```
+
+このため、`class_init` は型全体の振る舞いを登録する場所、`init` は object 1 個ごとの初期値を作る場所、`new()` は `g_object_new()` 後に constructor 引数相当の `device_path` を設定する入口である。
+
 `class_init` では型全体の vfunc を登録する。ここでは instance 固有の fd や driver 状態は触らない。
 
 ```text
