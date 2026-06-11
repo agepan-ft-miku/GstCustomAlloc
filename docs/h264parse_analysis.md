@@ -343,10 +343,161 @@ format 変換、AUD 挿入、SPS/PPS 挿入、SEI 更新では replacement buffe
 | format/alignment 追加 | pad template, enum, `format_from_caps()`, `negotiate()`, `wrap_nal()`, `set_caps()` | テストの組み合わせが増える。packetized/byte-stream 両方の変換経路が必要。 |
 | keyframe / random access 関連 | `process_nal()`, `pre_push_frame()`, force-key-unit event 処理 | `DELTA_UNIT`, SPS/PPS 再送、pending event の seqnum 継承を崩さない。 |
 | low-latency 動作 | `handle_frame()`, `collect_nal()`, latency 設定 | AU 完了判定と caps 完成待ちの queue 挙動を変えるため回帰リスクが高い。 |
+| 入出力ゼロコピー | `parse_frame()`, `pre_push_frame()`, `wrap_nal()`, SPS/PPS/SEI 挿入処理 | payload rewrite を伴う経路と no-rewrite 経路を分ける。単純な passthrough 復活は避ける。 |
+| picture 後 trailing data 無視 | `handle_frame()`, `handle_frame_packetized()` | Annex-B の一般ケースでは安全な終端判定が難しいため、opt-in かつ検出可能範囲に限定する。 |
 
 このリポジトリの codec plugin に関係する観点では、`h264parse` の責務を decoder/encoder 内へ取り込むよりも、引き続き前後段に `h264parse` を置き、ローカル element は `byte-stream,alignment=au` を前提に保つ方が実装面のリスクは低い。独自機能が parser の責務に入る場合は、`h264parse` 相当の state machine を local plugin 内に複製するのではなく、上流 `h264parse` のどの段階に hook するか、または別 element として parser 後段に置けるかを先に検討する。
 
-## 7. ソース照合チェック
+## 7. 追加検討機能
+
+### 7.1 入出力バッファのゼロコピー対応
+
+#### 目的
+
+compressed H.264 bitstream の parser として、入力 `GstBuffer` の payload memory をできるだけ複製せず、出力 `GstBuffer` から同じ `GstMemory` を参照できるようにする。特に hardware codec や DMA-BUF 系の bitstream buffer を扱う場合、payload copy を避けることで CPU 負荷、メモリ帯域、latency を下げることが目的になる。
+
+ただし、`h264parse` は bitstream parser なので、NAL header、SPS/PPS、SEI、slice header を読むための CPU read access は必要である。ここでいうゼロコピーは「payload bytes を別 memory へコピーしない」という意味であり、「一切 map/read しない」という意味ではない。CPU map 不能な memory を直接 parser に通すには、別途 NAL offset/size/SPS/PPS などの side metadata が必要になる。
+
+#### 現状のコピー発生箇所
+
+現状実装で payload copy または buffer 再構成が発生する主な箇所は次の通り。
+
+- format 変換時: `process_nal()` が `wrap_nal()` で prefix 付き buffer を新規 allocate し、payload をコピーして `frame_out` adapter に蓄積する。
+- transformed output 確定時: `parse_frame()` が `frame_out` から replacement buffer を取り出して `frame->out_buffer` に設定する。
+- AUD 挿入時: AU alignment では `gst_buffer_copy()` 後に AUD memory を prepend する。NAL alignment では AUD を別 buffer として push する。
+- SPS/PPS 挿入時: AU alignment では `GstByteWriter` で元 buffer 全体を新 buffer に書き直す。
+- Picture Timing SEI 更新時: SEI の前後をコピーし、新 SEI memory を挿入した replacement buffer を作る。
+- `pre_push_frame()` 終盤で `gst_buffer_make_writable()` を呼ぶ。ただしこれは `GstBuffer` object の copy-on-write であり、memory payload まで必ず deep copy するとは限らない。
+
+#### 実装方針案
+
+ゼロコピー対応は 2 段階に分けるのが現実的である。
+
+**段階 1: no-rewrite fast path**
+
+入力と出力の `stream-format` / `alignment` が一致し、以下をすべて満たす場合は、payload を書き換えずに元 buffer または sub-buffer を出力する。
+
+- `transform == FALSE`
+- AUD 挿入が不要、または無効化されている
+- `config-interval == 0` かつ `push_codec == FALSE`
+- `update-timecode == FALSE`
+- caps 更新は必要でも payload rewrite は不要
+- trailing data trimming が不要、または sub-buffer 参照だけで切れる
+
+この段階では、既存の `can_passthrough` を単純に復活させるのではなく、frame ごとの NAL parsing は継続する。passthrough を完全に有効化すると、既存コメントにある通り multiresolution stream や MVC stream の caps 更新を取り逃がす恐れがあるためである。目標は「parse はするが payload はコピーしない」ことである。
+
+**段階 2: scatter/gather buffer rewrite**
+
+format 変換や NAL 挿入が必要な場合でも、元 payload 全体を `GstByteWriter` へコピーせず、複数 `GstMemory` を持つ `GstBuffer` として組み立てる。
+
+- AVC/byte-stream 変換: prefix は小さな新規 memory、NAL payload は元 buffer の region 参照にする。
+- AUD 挿入: AUD は小さな readonly memory、元 AU は既存 memory region を append する。
+- SPS/PPS 挿入: `[IDR 前の元 region] + [SPS/PPS 新規 memory] + [IDR 以降の元 region]` の multi-memory buffer にする。
+- SEI 更新: `[SEI 前の元 region] + [新 SEI memory] + [SEI 後の元 region]` にする。
+
+この方式では完全な no-copy ではないが、大きな H.264 payload のコピーは避けられる。小さな prefix、AUD、SPS/PPS、SEI だけを新規 memory にする設計である。実装時は `gst_buffer_copy_region()` で元 memory を共有する region buffer を作り、最終 buffer に memory を移す/参照する helper を用意する。元 buffer lifetime を保つため、必要なら `GstParentBufferMeta` 相当の親参照維持も確認する。
+
+#### 追加 property 案
+
+互換性を壊さないため、初期値は既存挙動のままにして opt-in にする。
+
+| property | type | default | 意味 |
+| --- | --- | --- | --- |
+| `zero-copy` | `gboolean` | `false` | 可能な範囲で入力 payload memory を出力に共有する。 |
+| `zero-copy-rewrite` | `gboolean` | `false` | 挿入/変換が必要な場合も multi-memory buffer で payload copy を避ける。 |
+
+`zero-copy=true` でも、下流が contiguous writable memory を要求して map した場合、下流側でコピーが発生する可能性は残る。したがって caps または allocation query で「下流が multi-memory / non-writable compressed buffer を受けられるか」を確認できるなら、その条件も入れるべきである。
+
+#### 制約とリスク
+
+- bitstream parser として header read は必要なので、CPU readable な memory が前提になる。
+- format/alignment 変換、AUD 挿入、SPS/PPS 挿入、SEI 更新を完全 copy-free にするには multi-memory buffer 化が必要で、下流互換性の確認が要る。
+- `GstBuffer` の metadata 追加は buffer object の writable 化を要求するが、payload memory の deep copy とは別問題である。実装評価では memory pointer/share の確認が必要。
+- `GstBaseParse` が内部 adapter でどのように input buffer を保持/切り出すかも確認対象になる。単体関数だけでなく harness test で memory 共有を検証する。
+- zero-copy fast path で parsing を省略すると、SPS/PPS/SEI による caps 変化、timecode meta、closed caption meta、HDR caps を失うため、本資料では推奨しない。
+
+#### テスト観点
+
+- 入力 buffer に custom `GstMemory` を付け、出力 buffer が同じ memory を参照していることを検証する。
+- `byte-stream,alignment=au -> byte-stream,alignment=au` で payload copy がないこと。
+- `byte-stream,alignment=nal -> byte-stream,alignment=au` で AU 集約時の latency と memory 共有が両立すること。
+- AUD/SPS/PPS/SEI 挿入時に、元 payload region がコピーされず共有されること。
+- downstream が buffer を map した場合に期待通り読めること。
+- `config-interval=-1`, `update-timecode=true`, force-key-unit, HDR SEI, caption SEI で既存機能が退行しないこと。
+
+### 7.2 1 ピクチャの NAL 終端以降に付属した不要データの無視
+
+#### 目的
+
+一部の upstream や hardware encoder が、1 picture / 1 AU の有効 H.264 NAL 列の後ろに padding、固定長 slot の残り、未使用領域などを付けた buffer を出す場合がある。この不要データを downstream decoder へ渡さず、parser で切り落とす機能を検討する。
+
+この機能は、現状の「先頭ゴミ skip」や「壊れた NAL skip」とは別の問題である。既存実装は byte-stream の先頭ゴミを `skipsize` で読み飛ばせるが、picture payload 後ろの余分な byte は、多くの場合「最後の NAL の一部」として扱われる。
+
+#### H.264 上の難点
+
+Annex-B byte-stream では、NAL unit の終端は通常「次の start code」または stream/buffer 終端で決まる。VCL slice NAL の内部には RBSP trailing bits があるが、parser が slice payload の entropy coded data を最後まで完全 decode しない限り、「ここで本当に NAL が終わった」と一般に判定することはできない。
+
+そのため、任意の slice NAL に対して「NAL 終端以降の不要データ」を安全に自動検出することは難しい。誤って有効な slice payload を切ると decode 破損になる。実装は opt-in にし、検出可能なケースから限定的に扱うべきである。
+
+#### 現状挙動
+
+byte-stream 入力の `handle_frame()` は次の挙動を持つ。
+
+- buffer 先頭に start code 前のゴミがあれば `skipsize` で skip する。
+- `GST_H264_PARSER_NO_NAL_END` の場合、入力 caps が `alignment=nal` または `alignment=au` なら buffer 末尾までを NAL とみなす。
+- 途中で壊れた NAL を検出した場合、先頭なら skip、途中なら現在 AU を終端させる。
+- `framesize = nalu.offset + nalu.size` として `gst_base_parse_finish_frame()` へ渡す。
+
+packetized AVC/AVC3 入力では length prefix により NAL size が明示されるため、NAL 列の合計後に余り byte があるかは比較的検出しやすい。ただし現状の non-split packetized path は最終的に `map.size` 全体で finish するため、余り byte を明示的に trim する設計にはなっていない。
+
+#### 実装方針案
+
+property は opt-in とし、既存挙動を default にする。
+
+| property | type | default | 意味 |
+| --- | --- | --- | --- |
+| `ignore-trailing-picture-data` | `gboolean` | `false` | 1 picture/AU の有効 NAL 列以降に検出できる不要 byte を出力から除外する。 |
+| `trailing-picture-data-policy` | enum | `strict` | `strict`: 安全に検出できる場合のみ切る。`padding-zero`: 末尾の 0 padding のみ切る。`packetized-leftover`: AVC length prefix 後の余りを切る。 |
+
+最初に実装する範囲は、誤検出リスクが低い次のケースに限定する。
+
+- packetized input で、length prefix から NAL 列の終端が明確に分かり、その後ろに余り byte がある場合。
+- byte-stream input で、最後の有効 NAL 後ろが 0 padding のみで、次の start code と誤認されない場合。
+- upstream が別途有効 payload size を meta/caps/side-channel で渡せる場合。
+
+VCL slice payload の rbsp trailing bits を解析して任意 byte を切る実装は、初期対応から外す。必要なら H.264 entropy parser レベルの検証が必要になる。
+
+#### 処理位置
+
+byte-stream path:
+
+- `handle_frame()` の NAL 識別後、`framesize` を決める直前に `valid_end` を計算する。
+- `valid_end < framesize` の場合、`framesize = valid_end` として `gst_base_parse_finish_frame()` に渡す。
+- zero-copy 対応と組み合わせる場合、trim は payload copy ではなく sub-buffer/region で表現する。
+
+packetized path:
+
+- `handle_frame_packetized()` の NAL 走査中に、最後に正常識別できた NAL の終端 offset を保持する。
+- `last_valid_end < map.size` かつ policy が許可する場合、non-split path でも `gst_base_parse_finish_frame(parse, frame, last_valid_end)` 相当で余りを出力しない。
+- split path では既存の leftover warning/drop/error と整合させる。policy によっては error ではなく余り byte drop に変える。
+
+#### 制約とリスク
+
+- Annex-B の一般ケースでは「終端後の不要データ」と「NAL payload の一部」を parser だけで区別できない。
+- 末尾 0 byte は cabac_zero_word や byte-stream padding として許容される場合があるが、すべての 0 を無条件に削る設計は避ける。
+- AU alignment で不要 byte を切る場合、`MARKER`, timestamp, duration, `idr_pos`, `sei_pos`, `pic_timing_sei_pos` などの offset state と矛盾しないことを確認する。
+- trimming 後に `config-interval` や `update-timecode` が走ると、挿入位置計算が変わる可能性がある。trim は挿入前の入力境界確定段階で行い、以降の offset は trim 済み buffer に対して扱うのが安全である。
+
+#### テスト観点
+
+- `byte-stream,alignment=au` の IDR AU 後ろに 0 padding を付け、出力から padding が落ちること。
+- `byte-stream,alignment=nal` の NAL 後ろに 0 padding を付け、NAL payload を壊さず trim されること。
+- AVC packetized buffer の NAL length 合計後に余り byte を付け、policy に従い trim/drop/error が切り替わること。
+- 有効 slice payload の末尾に 0 が含まれるケースで誤 trim しないこと。
+- trailing data を切っても `DISCONT`, `MARKER`, `DELTA_UNIT`, `HEADER`, timecode meta, caption meta が維持されること。
+- zero-copy 有効時、trimmed output が元 memory region を共有し payload copy しないこと。
+
+## 8. ソース照合チェック
 
 資料作成後、以下の観点で上流ソースと再照合した。
 
@@ -359,8 +510,10 @@ format 変換、AUD 挿入、SPS/PPS 挿入、SEI 更新では replacement buffe
 - `pre_push_frame()` が AUD 挿入、force-key-unit、timecode SEI 更新、SPS/PPS 挿入、timecode/user data meta 付与を処理することを確認。
 - `sink_event` / `src_event` の独自処理は force-key-unit、flush/segment、trickmode forward predicted に限定され、それ以外は base class へ委譲されることを確認。
 - テストは通常 parsing、drain、garbage skip、stream 検出、HDR SEI caps、caps reordering、profile compatibility、packetized input、NAL/AU alignment 変換、caption SEI、start code split、複数出力形式 (`byte-stream nal`, `byte-stream au`, `avc au`, `avc3 au`) を確認している。
+- ゼロコピー検討について、現行実装の `wrap_nal()`、`frame_out` adapter、`GstByteWriter`、AUD prepend、SEI replacement、`gst_buffer_make_writable()` の各 buffer 変更箇所を確認した。
+- trailing data 無視検討について、byte-stream path の `skipsize`、`NO_NAL_END`、`framesize` 決定、packetized path の leftover 処理を確認した。
 
-## 8. 参照箇所メモ
+## 9. 参照箇所メモ
 
 - `gsth264parse.c:88-98`: pad template
 - `gsth264parse.c:144-174`: property 定義
